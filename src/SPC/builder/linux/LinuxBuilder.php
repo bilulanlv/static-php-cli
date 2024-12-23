@@ -35,7 +35,7 @@ class LinuxBuilder extends UnixBuilderBase
 
         GlobalEnvManager::init($this);
 
-        if (str_ends_with(getenv('CC'), 'linux-musl-gcc') && !file_exists("/usr/local/musl/bin/{$arch}-linux-musl-gcc")) {
+        if (str_ends_with(getenv('CC'), 'linux-musl-gcc') && !file_exists("/usr/local/musl/bin/{$arch}-linux-musl-gcc") && (getenv('SPC_NO_MUSL_PATH') !== 'yes')) {
             throw new WrongUsageException('musl-cross-make not installed, please install it first. (You can use `doctor` command to install it)');
         }
 
@@ -134,6 +134,11 @@ class LinuxBuilder extends UnixBuilderBase
         }
         $disable_jit = $this->getOption('disable-opcache-jit', false) ? '--disable-opcache-jit ' : '';
 
+        $config_file_path = $this->getOption('with-config-file-path', false) ?
+            ('--with-config-file-path=' . $this->getOption('with-config-file-path') . ' ') : '';
+        $config_file_scan_dir = $this->getOption('with-config-file-scan-dir', false) ?
+            ('--with-config-file-scan-dir=' . $this->getOption('with-config-file-scan-dir') . ' ') : '';
+
         $enable_cli = ($build_target & BUILD_TARGET_CLI) === BUILD_TARGET_CLI;
         $enable_fpm = ($build_target & BUILD_TARGET_FPM) === BUILD_TARGET_FPM;
         $enable_micro = ($build_target & BUILD_TARGET_MICRO) === BUILD_TARGET_MICRO;
@@ -149,7 +154,11 @@ class LinuxBuilder extends UnixBuilderBase
 
         // process micro upx patch if micro sapi enabled
         if ($enable_micro) {
-            $this->processMicroUPX();
+            if (version_compare($this->getMicroVersion(), '0.2.0') < 0) {
+                // for phpmicro 0.1.x
+                $this->processMicroUPXLegacy();
+            }
+            // micro latest needs do strip and upx pack later (strip, upx, cut binary manually supported)
         }
 
         shell()->cd(SOURCE_PATH . '/php-src')
@@ -159,6 +168,8 @@ class LinuxBuilder extends UnixBuilderBase
                 ($enable_fpm ? '--enable-fpm ' : '--disable-fpm ') .
                 ($enable_embed ? '--enable-embed=static ' : '--disable-embed ') .
                 ($enable_micro ? '--enable-micro=all-static ' : '--disable-micro ') .
+                $config_file_path .
+                $config_file_scan_dir .
                 $disable_jit .
                 $json_74 .
                 $zts .
@@ -236,7 +247,7 @@ class LinuxBuilder extends UnixBuilderBase
         }
         if ($this->getExt('phar')) {
             $this->phar_patched = true;
-            SourcePatcher::patchMicro(['phar']);
+            SourcePatcher::patchMicroPhar($this->getPHPVersionID());
         }
 
         $enable_fake_cli = $this->getOption('with-micro-fake-cli', false) ? ' -DPHP_MICRO_FAKE_CLI' : '';
@@ -250,10 +261,12 @@ class LinuxBuilder extends UnixBuilderBase
             ->exec('sed -i "s|//lib|/lib|g" Makefile')
             ->exec("\$SPC_CMD_PREFIX_PHP_MAKE {$vars} micro");
 
+        $this->processMicroUPX();
+
         $this->deployBinary(BUILD_TARGET_MICRO);
 
         if ($this->phar_patched) {
-            SourcePatcher::patchMicro(['phar'], true);
+            SourcePatcher::unpatchMicroPhar();
         }
     }
 
@@ -304,11 +317,11 @@ class LinuxBuilder extends UnixBuilderBase
     }
 
     /**
-     * Apply option --no-strip and --with-upx-pack for micro sapi.
+     * Apply option --no-strip and --with-upx-pack for micro sapi (only for phpmicro 0.1.x)
      *
      * @throws FileSystemException
      */
-    private function processMicroUPX(): void
+    private function processMicroUPXLegacy(): void
     {
         // upx pack and strip for micro
         // but always restore Makefile.frag.bak first
@@ -344,6 +357,28 @@ class LinuxBuilder extends UnixBuilderBase
                 '/POST_MICRO_BUILD_COMMANDS=.*/',
                 'POST_MICRO_BUILD_COMMANDS=true',
             );
+        }
+    }
+
+    private function processMicroUPX(): void
+    {
+        if (version_compare($this->getMicroVersion(), '0.2.0') >= 0 && !$this->getOption('no-strip', false)) {
+            shell()->exec('strip --strip-all ' . SOURCE_PATH . '/php-src/sapi/micro/micro.sfx');
+
+            if ($this->getOption('with-upx-pack')) {
+                // strip first
+                shell()->exec(getenv('UPX_EXEC') . ' --best ' . SOURCE_PATH . '/php-src/sapi/micro/micro.sfx');
+                // cut binary with readelf
+                [$ret, $out] = shell()->execWithResult('readelf -l ' . SOURCE_PATH . '/php-src/sapi/micro/micro.sfx | awk \'/LOAD|GNU_STACK/ {getline; print $1, $2, $3, $4, $6, $7}\'');
+                $out[1] = explode(' ', $out[1]);
+                $offset = $out[1][0];
+                if ($ret !== 0 || !str_starts_with($offset, '0x')) {
+                    throw new RuntimeException('Cannot find offset in readelf output');
+                }
+                $offset = hexdec($offset);
+                // remove upx extra wastes
+                file_put_contents(SOURCE_PATH . '/php-src/sapi/micro/micro.sfx', substr(file_get_contents(SOURCE_PATH . '/php-src/sapi/micro/micro.sfx'), 0, $offset));
+            }
         }
     }
 }

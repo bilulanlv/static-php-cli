@@ -6,9 +6,11 @@ namespace SPC\builder;
 
 use SPC\exception\ExceptionHandler;
 use SPC\exception\FileSystemException;
+use SPC\exception\InterruptException;
 use SPC\exception\RuntimeException;
 use SPC\exception\WrongUsageException;
 use SPC\store\Config;
+use SPC\store\FileSystem;
 use SPC\store\SourceManager;
 use SPC\util\CustomExt;
 
@@ -22,6 +24,12 @@ abstract class BuilderBase
 
     /** @var array<string, Extension> extensions */
     protected array $exts = [];
+
+    /** @var array<int, string> extension names */
+    protected array $ext_list = [];
+
+    /** @var array<int, string> library names */
+    protected array $lib_list = [];
 
     /** @var bool compile libs only (just mark it) */
     protected bool $libs_only = false;
@@ -44,20 +52,22 @@ abstract class BuilderBase
     abstract public function proveLibs(array $sorted_libraries);
 
     /**
-     * Build libraries
+     * Set-Up libraries
      *
      * @throws FileSystemException
      * @throws RuntimeException
      * @throws WrongUsageException
      */
-    public function buildLibs(): void
+    public function setupLibs(): void
     {
         // build all libs
         foreach ($this->libs as $lib) {
-            match ($lib->tryBuild($this->getOption('rebuild', false))) {
-                BUILD_STATUS_OK => logger()->info('lib [' . $lib::NAME . '] build success'),
-                BUILD_STATUS_ALREADY => logger()->notice('lib [' . $lib::NAME . '] already built'),
-                BUILD_STATUS_FAILED => logger()->error('lib [' . $lib::NAME . '] build failed'),
+            $starttime = microtime(true);
+            match ($lib->setup($this->getOption('rebuild', false))) {
+                LIB_STATUS_OK => logger()->info('lib [' . $lib::NAME . '] setup success, took ' . round(microtime(true) - $starttime, 2) . ' s'),
+                LIB_STATUS_ALREADY => logger()->notice('lib [' . $lib::NAME . '] already built'),
+                LIB_STATUS_BUILD_FAILED => logger()->error('lib [' . $lib::NAME . '] build failed'),
+                LIB_STATUS_INSTALL_FAILED => logger()->error('lib [' . $lib::NAME . '] install failed'),
                 default => logger()->warning('lib [' . $lib::NAME . '] build status unknown'),
             };
         }
@@ -157,10 +167,10 @@ abstract class BuilderBase
      * @throws FileSystemException
      * @throws RuntimeException
      * @throws \ReflectionException
-     * @throws WrongUsageException
+     * @throws \Throwable|WrongUsageException
      * @internal
      */
-    public function proveExts(array $extensions): void
+    public function proveExts(array $extensions, bool $skip_check_deps = false): void
     {
         CustomExt::loadCustomExt();
         $this->emitPatchPoint('before-php-extract');
@@ -180,9 +190,14 @@ abstract class BuilderBase
             $this->addExt($ext);
         }
 
+        if ($skip_check_deps) {
+            return;
+        }
+
         foreach ($this->exts as $ext) {
             $ext->checkDependency();
         }
+        $this->ext_list = $extensions;
     }
 
     /**
@@ -269,10 +284,28 @@ abstract class BuilderBase
                 return false;
             }
         }
-        if (preg_match('/php-(\d+\.\d+\.\d+)/', $file, $match)) {
+        if (preg_match('/php-(\d+\.\d+\.\d+(?:RC\d+)?)\.tar\.(?:gz|bz2|xz)/', $file, $match)) {
             return $match[1];
         }
         return false;
+    }
+
+    public function getMicroVersion(): false|string
+    {
+        $file = FileSystem::convertPath(SOURCE_PATH . '/php-src/sapi/micro/php_micro.h');
+        if (!file_exists($file)) {
+            return false;
+        }
+
+        $content = file_get_contents($file);
+        $ver = '';
+        preg_match('/#define PHP_MICRO_VER_MAJ (\d)/m', $content, $match);
+        $ver .= $match[1] . '.';
+        preg_match('/#define PHP_MICRO_VER_MIN (\d)/m', $content, $match);
+        $ver .= $match[1] . '.';
+        preg_match('/#define PHP_MICRO_VER_PAT (\d)/m', $content, $match);
+        $ver .= $match[1];
+        return $ver;
     }
 
     /**
@@ -382,6 +415,13 @@ abstract class BuilderBase
                 }
                 logger()->debug('Running additional patch script: ' . $patch);
                 require $patch;
+            } catch (InterruptException $e) {
+                if ($e->getCode() === 0) {
+                    logger()->notice('Patch script ' . $patch . ' interrupted' . ($e->getMessage() ? (': ' . $e->getMessage()) : '.'));
+                } else {
+                    logger()->error('Patch script ' . $patch . ' interrupted with error code [' . $e->getCode() . ']' . ($e->getMessage() ? (': ' . $e->getMessage()) : '.'));
+                }
+                exit($e->getCode());
             } catch (\Throwable $e) {
                 logger()->critical('Patch script ' . $patch . ' failed to run.');
                 if ($this->getOption('debug')) {
@@ -389,31 +429,8 @@ abstract class BuilderBase
                 } else {
                     logger()->critical('Please check with --debug option to see more details.');
                 }
+                throw $e;
             }
-        }
-    }
-
-    /**
-     * Check if all libs are downloaded.
-     * If not, throw exception.
-     *
-     * @throws RuntimeException
-     */
-    protected function checkLibsSource(): void
-    {
-        $not_downloaded = [];
-        foreach ($this->libs as $lib) {
-            if (!file_exists($lib->getSourceDir())) {
-                $not_downloaded[] = $lib::NAME;
-            }
-        }
-        if ($not_downloaded !== []) {
-            throw new RuntimeException(
-                '"' . implode(', ', $not_downloaded) .
-                '" totally ' . count($not_downloaded) .
-                ' source' . (count($not_downloaded) === 1 ? '' : 's') .
-                ' not downloaded, maybe you need to "fetch" ' . (count($not_downloaded) === 1 ? 'it' : 'them') . ' first?'
-            );
         }
     }
 
@@ -433,5 +450,30 @@ abstract class BuilderBase
         }
         $php .= "echo '[micro-test-end]';\n";
         return $php;
+    }
+
+    protected function getMicroTestTasks(): array
+    {
+        return [
+            'micro_ext_test' => [
+                'content' => ($this->getOption('without-micro-ext-test') ? '<?php echo "[micro-test-start][micro-test-end]";' : $this->generateMicroExtTests()),
+                'conditions' => [
+                    // program success
+                    function ($ret) { return $ret === 0; },
+                    // program returns expected output
+                    function ($ret, $out) {
+                        $raw_out = trim(implode('', $out));
+                        return str_starts_with($raw_out, '[micro-test-start]') && str_ends_with($raw_out, '[micro-test-end]');
+                    },
+                ],
+            ],
+            'micro_zend_bug_test' => [
+                'content' => ($this->getOption('without-micro-ext-test') ? '<?php echo "hello";' : file_get_contents(ROOT_DIR . '/src/globals/common-tests/micro_zend_mm_heap_corrupted.txt')),
+                'conditions' => [
+                    // program success
+                    function ($ret) { return $ret === 0; },
+                ],
+            ],
+        ];
     }
 }

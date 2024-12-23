@@ -11,8 +11,8 @@ use SPC\exception\RuntimeException;
 use SPC\exception\WrongUsageException;
 use SPC\store\Config;
 use SPC\store\FileSystem;
-use SPC\store\SourceManager;
 use SPC\util\DependencyUtil;
+use SPC\util\SPCConfigUtil;
 
 abstract class UnixBuilderBase extends BuilderBase
 {
@@ -96,7 +96,7 @@ abstract class UnixBuilderBase extends BuilderBase
         $support_lib_list = [];
         $classes = FileSystem::getClassesPsr4(
             ROOT_DIR . '/src/SPC/builder/' . osfamily2dir() . '/library',
-            'SPC\\builder\\' . osfamily2dir() . '\\library'
+            'SPC\builder\\' . osfamily2dir() . '\library'
         );
         foreach ($classes as $class) {
             if (defined($class . '::NAME') && $class::NAME !== 'unknown' && Config::getLib($class::NAME) !== null) {
@@ -129,14 +129,7 @@ abstract class UnixBuilderBase extends BuilderBase
         foreach ($this->libs as $lib) {
             $lib->calcDependency();
         }
-
-        // patch point
-        $this->emitPatchPoint('before-libs-extract');
-
-        // extract sources
-        SourceManager::initSource(libs: $sorted_libraries);
-
-        $this->emitPatchPoint('after-libs-extract');
+        $this->lib_list = $sorted_libraries;
     }
 
     /**
@@ -162,23 +155,47 @@ abstract class UnixBuilderBase extends BuilderBase
 
         // sanity check for phpmicro
         if (($build_target & BUILD_TARGET_MICRO) === BUILD_TARGET_MICRO) {
-            if (file_exists(SOURCE_PATH . '/hello.exe')) {
-                @unlink(SOURCE_PATH . '/hello.exe');
-            }
-            file_put_contents(
-                SOURCE_PATH . '/hello.exe',
-                file_get_contents(SOURCE_PATH . '/php-src/sapi/micro/micro.sfx') .
-                ($this->getOption('without-micro-ext-test') ? '<?php echo "[micro-test-start][micro-test-end]";' : $this->generateMicroExtTests())
-            );
-            chmod(SOURCE_PATH . '/hello.exe', 0755);
-            [$ret, $output2] = shell()->execWithResult(SOURCE_PATH . '/hello.exe');
-            $raw_out = trim(implode('', $output2));
-            $condition[0] = $ret === 0;
-            $condition[1] = str_starts_with($raw_out, '[micro-test-start]') && str_ends_with($raw_out, '[micro-test-end]');
-            foreach ($condition as $k => $v) {
-                if (!$v) {
-                    throw new RuntimeException("micro failed sanity check with condition[{$k}], ret[{$ret}], out[{$raw_out}]");
+            $test_task = $this->getMicroTestTasks();
+            foreach ($test_task as $task_name => $task) {
+                $test_file = SOURCE_PATH . '/' . $task_name . '.exe';
+                if (file_exists($test_file)) {
+                    @unlink($test_file);
                 }
+                file_put_contents($test_file, file_get_contents(SOURCE_PATH . '/php-src/sapi/micro/micro.sfx') . $task['content']);
+                chmod($test_file, 0755);
+                [$ret, $out] = shell()->execWithResult($test_file);
+                foreach ($task['conditions'] as $condition => $closure) {
+                    if (!$closure($ret, $out)) {
+                        $raw_out = trim(implode('', $out));
+                        throw new RuntimeException("micro failed sanity check: {$task_name}, condition [{$condition}], ret[{$ret}], out[{$raw_out}]");
+                    }
+                }
+            }
+        }
+
+        // sanity check for embed
+        if (($build_target & BUILD_TARGET_EMBED) === BUILD_TARGET_EMBED) {
+            logger()->info('running embed sanity check');
+            $sample_file_path = SOURCE_PATH . '/embed-test';
+            if (!is_dir($sample_file_path)) {
+                @mkdir($sample_file_path);
+            }
+            // copy embed test files
+            copy(ROOT_DIR . '/src/globals/common-tests/embed.c', $sample_file_path . '/embed.c');
+            copy(ROOT_DIR . '/src/globals/common-tests/embed.php', $sample_file_path . '/embed.php');
+            $util = new SPCConfigUtil($this);
+            $config = $util->config($this->ext_list, $this->lib_list, $this->getOption('with-suggested-exts'), $this->getOption('with-suggested-libs'));
+            $lens = "{$config['cflags']} {$config['ldflags']} {$config['libs']}";
+            if (PHP_OS_FAMILY === 'Linux') {
+                $lens .= ' -static';
+            }
+            [$ret, $out] = shell()->cd($sample_file_path)->execWithResult(getenv('CC') . ' -o embed embed.c ' . $lens);
+            if ($ret !== 0) {
+                throw new RuntimeException('embed failed sanity check: build failed. Error message: ' . implode("\n", $out));
+            }
+            [$ret, $output] = shell()->cd($sample_file_path)->execWithResult('./embed');
+            if ($ret !== 0 || trim(implode('', $output)) !== 'hello') {
+                throw new RuntimeException('embed failed sanity check: run failed. Error message: ' . implode("\n", $output));
             }
         }
     }

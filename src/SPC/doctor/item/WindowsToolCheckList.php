@@ -37,10 +37,10 @@ class WindowsToolCheckList
     #[AsCheckItem('if php-sdk-binary-tools are downloaded', limit_os: 'Windows', level: 997)]
     public function checkSDK(): ?CheckResult
     {
-        if (!file_exists(PHP_SDK_PATH . DIRECTORY_SEPARATOR . 'phpsdk-starter.bat')) {
+        if (!file_exists(getenv('PHP_SDK_PATH') . DIRECTORY_SEPARATOR . 'phpsdk-starter.bat')) {
             return CheckResult::fail('php-sdk-binary-tools not downloaded', 'install-php-sdk');
         }
-        return CheckResult::ok(PHP_SDK_PATH);
+        return CheckResult::ok(getenv('PHP_SDK_PATH'));
     }
 
     #[AsCheckItem('if git associated command exists', limit_os: 'Windows', level: 996)]
@@ -71,7 +71,7 @@ class WindowsToolCheckList
         if (($path = SystemUtil::findCommand('perl.exe')) === null) {
             return CheckResult::fail('perl not found in path.', 'install-perl');
         }
-        if (!str_contains(implode('', cmd()->execWithResult(quote($path) . ' -v')[1]), 'MSWin32')) {
+        if (!str_contains(implode('', cmd()->execWithResult(quote($path) . ' -v', false)[1]), 'MSWin32')) {
             return CheckResult::fail($path . ' is not built for msvc.', 'install-perl');
         }
         return CheckResult::ok();
@@ -81,8 +81,8 @@ class WindowsToolCheckList
     public function installPhpSdk(): bool
     {
         try {
-            FileSystem::removeDir(PHP_SDK_PATH);
-            cmd(true)->exec('git.exe clone --depth 1 https://github.com/php/php-sdk-binary-tools.git ' . PHP_SDK_PATH);
+            FileSystem::removeDir(getenv('PHP_SDK_PATH'));
+            cmd(true)->exec('git.exe clone --depth 1 https://github.com/php/php-sdk-binary-tools.git ' . getenv('PHP_SDK_PATH'));
         } catch (RuntimeException) {
             return false;
         }

@@ -37,7 +37,7 @@ class MacOSBuilder extends UnixBuilderBase
         $this->arch_c_flags = getenv('SPC_DEFAULT_C_FLAGS');
         $this->arch_cxx_flags = getenv('SPC_DEFAULT_CXX_FLAGS');
         // cmake toolchain
-        $this->cmake_toolchain_file = SystemUtil::makeCmakeToolchainFile('Darwin', $this->getOption('arch'), $this->arch_c_flags);
+        $this->cmake_toolchain_file = SystemUtil::makeCmakeToolchainFile('Darwin', $this->getOption('arch', php_uname('m')), $this->arch_c_flags);
 
         // create pkgconfig and include dir (some libs cannot create them automatically)
         f_mkdir(BUILD_LIB_PATH . '/pkgconfig', recursive: true);
@@ -137,6 +137,11 @@ class MacOSBuilder extends UnixBuilderBase
         $json_74 = $this->getPHPVersionID() < 80000 ? '--enable-json ' : '';
         $zts = $this->getOption('enable-zts', false) ? '--enable-zts --disable-zend-signals ' : '';
 
+        $config_file_path = $this->getOption('with-config-file-path', false) ?
+            ('--with-config-file-path=' . $this->getOption('with-config-file-path') . ' ') : '';
+        $config_file_scan_dir = $this->getOption('with-config-file-scan-dir', false) ?
+            ('--with-config-file-scan-dir=' . $this->getOption('with-config-file-scan-dir') . ' ') : '';
+
         $enableCli = ($build_target & BUILD_TARGET_CLI) === BUILD_TARGET_CLI;
         $enableFpm = ($build_target & BUILD_TARGET_FPM) === BUILD_TARGET_FPM;
         $enableMicro = ($build_target & BUILD_TARGET_MICRO) === BUILD_TARGET_MICRO;
@@ -164,6 +169,8 @@ class MacOSBuilder extends UnixBuilderBase
                 ($enableFpm ? '--enable-fpm ' : '--disable-fpm ') .
                 ($enableEmbed ? '--enable-embed=static ' : '--disable-embed ') .
                 ($enableMicro ? '--enable-micro ' : '--disable-micro ') .
+                $config_file_path .
+                $config_file_scan_dir .
                 $json_74 .
                 $zts .
                 $this->makeExtensionArgs() . ' ' .
@@ -233,7 +240,7 @@ class MacOSBuilder extends UnixBuilderBase
         }
         if ($this->getExt('phar')) {
             $this->phar_patched = true;
-            SourcePatcher::patchMicro(['phar']);
+            SourcePatcher::patchMicroPhar($this->getPHPVersionID());
         }
 
         $enable_fake_cli = $this->getOption('with-micro-fake-cli', false) ? ' -DPHP_MICRO_FAKE_CLI' : '';
@@ -241,7 +248,7 @@ class MacOSBuilder extends UnixBuilderBase
 
         // patch fake cli for micro
         $vars['EXTRA_CFLAGS'] .= $enable_fake_cli;
-        if (!$this->getOption('no-strip', false)) {
+        if ($this->getOption('no-strip', false)) {
             $vars['STRIP'] = 'dsymutil -f ';
         }
         $vars = SystemUtil::makeEnvVarString($vars);
@@ -251,7 +258,7 @@ class MacOSBuilder extends UnixBuilderBase
         $this->deployBinary(BUILD_TARGET_MICRO);
 
         if ($this->phar_patched) {
-            SourcePatcher::patchMicro(['phar'], true);
+            SourcePatcher::unpatchMicroPhar();
         }
     }
 

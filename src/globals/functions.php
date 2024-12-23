@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Psr\Log\LoggerInterface;
 use SPC\builder\BuilderBase;
 use SPC\builder\BuilderProvider;
+use SPC\exception\InterruptException;
 use SPC\exception\RuntimeException;
 use SPC\exception\WrongUsageException;
 use SPC\util\UnixShell;
@@ -29,6 +30,11 @@ function logger(): LoggerInterface
         return new ConsoleLogger();
     }
     return $ob_logger;
+}
+
+function is_unix(): bool
+{
+    return in_array(PHP_OS_FAMILY, ['Linux', 'Darwin', 'BSD']);
 }
 
 /**
@@ -56,7 +62,7 @@ function arch2gnu(string $arch): string
  */
 function match_pattern(string $pattern, string $subject): bool
 {
-    $pattern = str_replace(['\*', '\\\\.*'], ['.*', '\*'], preg_quote($pattern, '/'));
+    $pattern = str_replace(['\*', '\\\.*'], ['.*', '\*'], preg_quote($pattern, '/'));
     $pattern = '/^' . $pattern . '$/i';
     return preg_match($pattern, $subject) === 1;
 }
@@ -120,6 +126,11 @@ function patch_point(): string
     return BuilderProvider::getBuilder()->getPatchPoint();
 }
 
+function patch_point_interrupt(int $retcode, string $msg = ''): InterruptException
+{
+    return new InterruptException(message: $msg, code: $retcode);
+}
+
 // ------- function f_* part -------
 // f_ means standard function wrapper
 
@@ -140,7 +151,7 @@ function f_passthru(string $cmd): ?bool
     if ($danger) {
         logger()->notice('Running dangerous command: ' . $cmd);
     } else {
-        logger()->debug('Running command with direct output: ' . $cmd);
+        logger()->debug('[PASSTHRU] ' . $cmd);
     }
     $ret = passthru($cmd, $code);
     if ($code !== 0) {

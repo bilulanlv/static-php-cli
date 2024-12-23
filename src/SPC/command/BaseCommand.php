@@ -10,6 +10,7 @@ use Psr\Log\LogLevel;
 use SPC\ConsoleApplication;
 use SPC\exception\ExceptionHandler;
 use SPC\exception\WrongUsageException;
+use SPC\util\GlobalEnvManager;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Helper\QuestionHelper;
 use Symfony\Component\Console\Input\InputInterface;
@@ -94,8 +95,15 @@ abstract class BaseCommand extends Command
             $question = new ConfirmationQuestion($prompt->label . $case, $prompt->default);
             return $helper->ask($input, $output, $question);
         });
+
+        // init GlobalEnv
+        if (!$this instanceof BuildCommand) {
+            GlobalEnvManager::init();
+        }
         if ($this->shouldExecute()) {
             try {
+                // show raw argv list for logger()->debug
+                logger()->debug('argv: ' . implode(' ', $_SERVER['argv']));
                 return $this->handle();
             } catch (WrongUsageException $e) {
                 $msg = explode("\n", $e->getMessage());
@@ -141,5 +149,32 @@ abstract class BaseCommand extends Command
         }
         logger()->error($fail_msg);
         return static::FAILURE;
+    }
+
+    /**
+     * Parse extension list from string, replace alias and filter internal extensions.
+     *
+     * @param string $ext_list Extension string list, e.g. "mbstring,posix,sockets"
+     */
+    protected function parseExtensionList(string $ext_list): array
+    {
+        // replace alias
+        $ls = array_map(function ($x) {
+            $lower = strtolower(trim($x));
+            if (isset(SPC_EXTENSION_ALIAS[$lower])) {
+                logger()->notice("Extension [{$lower}] is an alias of [" . SPC_EXTENSION_ALIAS[$lower] . '], it will be replaced.');
+                return SPC_EXTENSION_ALIAS[$lower];
+            }
+            return $lower;
+        }, explode(',', $ext_list));
+
+        // filter internals
+        return array_values(array_filter($ls, function ($x) {
+            if (in_array($x, SPC_INTERNAL_EXTENSIONS)) {
+                logger()->warning("Extension [{$x}] is an builtin extension, it will be ignored.");
+                return false;
+            }
+            return true;
+        }));
     }
 }
